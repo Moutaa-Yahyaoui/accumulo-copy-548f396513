@@ -16,9 +16,6 @@
  */
 package org.apache.accumulo.server;
 
-import static com.google.common.base.Preconditions.checkArgument;
-
-import java.io.IOException;
 import java.util.Objects;
 import java.util.Properties;
 
@@ -26,7 +23,6 @@ import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.clientImpl.ClientContext;
 import org.apache.accumulo.core.clientImpl.ClientInfo;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
-import org.apache.accumulo.core.conf.Property;
 import org.apache.accumulo.core.conf.SiteConfiguration;
 import org.apache.accumulo.core.crypto.CryptoServiceFactory;
 import org.apache.accumulo.core.crypto.CryptoServiceFactory.ClassloaderType;
@@ -43,27 +39,33 @@ import org.apache.accumulo.server.security.SecurityUtil;
 import org.apache.accumulo.server.security.delegation.AuthenticationTokenSecretManager;
 import org.apache.accumulo.server.tables.TableManager;
 import org.apache.accumulo.server.tablets.UniqueNameAllocator;
-import org.apache.hadoop.security.UserGroupInformation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Provides a server context for Accumulo server components that operate with the system credentials
  * and have access to the system files and configuration.
+ *
+ * <p>
+ * This class has been refactored to delegate focused responsibilities to:
+ * <ul>
+ * <li>{@link ServerSecurityProcessor} for security-related operations</li>
+ * <li>{@link ServerRpcConfiguration} for RPC-related configuration</li>
+ * <li>{@link ServerResourceManager} for server resource management</li>
+ * </ul>
  */
 public class ServerContext extends ClientContext {
 
   private static final Logger log = LoggerFactory.getLogger(ServerContext.class);
 
   private final ServerInfo info;
-  private TableManager tableManager;
-  private UniqueNameAllocator nameAllocator;
-  private ZooReaderWriter zooReaderWriter;
-  private ServerConfigurationFactory serverConfFactory = null;
+  private final ServerResourceManager resourceManager;
+  private final ServerSecurityProcessor securityProcessor;
+  private final ServerRpcConfiguration rpcConfig;
+
   private String applicationName = null;
   private String applicationClassName = null;
   private String hostname = null;
-  private AuthenticationTokenSecretManager secretManager;
   private CryptoService cryptoService = null;
 
   public ServerContext(SiteConfiguration siteConfig) {
@@ -87,7 +89,10 @@ public class ServerContext extends ClientContext {
   private ServerContext(ServerInfo info) {
     super(info, info.getSiteConfiguration());
     this.info = info;
-    zooReaderWriter = new ZooReaderWriter(info.getSiteConfiguration());
+    this.resourceManager = new ServerResourceManager(this, info,
+        new ZooReaderWriter(info.getSiteConfiguration()));
+    this.securityProcessor = new ServerSecurityProcessor();
+    this.rpcConfig = new ServerRpcConfiguration();
   }
 
   public void setupServer(String appName, String appClassName, String hostname) {
@@ -128,11 +133,8 @@ public class ServerContext extends ClientContext {
     return hostname;
   }
 
-  public synchronized ServerConfigurationFactory getServerConfFactory() {
-    if (serverConfFactory == null) {
-      serverConfFactory = new ServerConfigurationFactory(this, info.getSiteConfiguration());
-    }
-    return serverConfFactory;
+  public ServerConfigurationFactory getServerConfFactory() {
+    return resourceManager.getServerConfFactory();
   }
 
   @Override
@@ -146,22 +148,7 @@ public class ServerContext extends ClientContext {
    */
   // Should be private, but package-protected so EasyMock will work
   void enforceKerberosLogin() {
-    final AccumuloConfiguration conf = getServerConfFactory().getSiteConfiguration();
-    // Unwrap _HOST into the FQDN to make the kerberos principal we'll compare against
-    final String kerberosPrincipal = SecurityUtil
-        .getServerPrincipal(conf.get(Property.GENERAL_KERBEROS_PRINCIPAL));
-    UserGroupInformation loginUser;
-    try {
-      // The system user should be logged in via keytab when the process is started, not the
-      // currentUser() like KerberosToken
-      loginUser = UserGroupInformation.getLoginUser();
-    } catch (IOException e) {
-      throw new RuntimeException("Could not get login user", e);
-    }
-
-    checkArgument(loginUser.hasKerberosCredentials(), "Server does not have Kerberos credentials");
-    checkArgument(kerberosPrincipal.equals(loginUser.getUserName()),
-        "Expected login user to be " + kerberosPrincipal + " but was " + loginUser.getUserName());
+    securityProcessor.enforceKerberosLogin(getServerConfFactory().getSiteConfiguration());
   }
 
   public VolumeManager getVolumeManager() {
@@ -169,23 +156,20 @@ public class ServerContext extends ClientContext {
   }
 
   public ZooReaderWriter getZooReaderWriter() {
-    return zooReaderWriter;
+    return resourceManager.getZooReaderWriter();
   }
 
   /**
    * Retrieve the SSL/TLS configuration for starting up a listening service
    */
   public SslConnectionParams getServerSslParams() {
-    return SslConnectionParams.forServer(getConfiguration());
+    return rpcConfig.getServerSslParams(getConfiguration());
   }
 
   @Override
   public SaslServerConnectionParams getSaslParams() {
-    AccumuloConfiguration conf = getServerConfFactory().getSiteConfiguration();
-    if (!conf.getBoolean(Property.INSTANCE_RPC_SASL_ENABLED)) {
-      return null;
-    }
-    return new SaslServerConnectionParams(conf, getCredentials().getToken(), secretManager);
+    return securityProcessor.getSaslParams(getServerConfFactory().getSiteConfiguration(),
+        getCredentials());
   }
 
   /**
@@ -194,48 +178,23 @@ public class ServerContext extends ClientContext {
    * @return A {@link ThriftServerType} value to denote the type of Thrift server to construct
    */
   public ThriftServerType getThriftServerType() {
-    AccumuloConfiguration conf = getConfiguration();
-    if (conf.getBoolean(Property.INSTANCE_RPC_SSL_ENABLED)) {
-      if (conf.getBoolean(Property.INSTANCE_RPC_SASL_ENABLED)) {
-        throw new IllegalStateException(
-            "Cannot create a Thrift server capable of both SASL and SSL");
-      }
-
-      return ThriftServerType.SSL;
-    } else if (conf.getBoolean(Property.INSTANCE_RPC_SASL_ENABLED)) {
-      if (conf.getBoolean(Property.INSTANCE_RPC_SSL_ENABLED)) {
-        throw new IllegalStateException(
-            "Cannot create a Thrift server capable of both SASL and SSL");
-      }
-
-      return ThriftServerType.SASL;
-    } else {
-      // Lets us control the type of Thrift server created, primarily for benchmarking purposes
-      String serverTypeName = conf.get(Property.GENERAL_RPC_SERVER_TYPE);
-      return ThriftServerType.get(serverTypeName);
-    }
+    return rpcConfig.getThriftServerType(getConfiguration());
   }
 
   public void setSecretManager(AuthenticationTokenSecretManager secretManager) {
-    this.secretManager = secretManager;
+    securityProcessor.setSecretManager(secretManager);
   }
 
   public AuthenticationTokenSecretManager getSecretManager() {
-    return secretManager;
+    return securityProcessor.getSecretManager();
   }
 
-  public synchronized TableManager getTableManager() {
-    if (tableManager == null) {
-      tableManager = new TableManager(this);
-    }
-    return tableManager;
+  public TableManager getTableManager() {
+    return resourceManager.getTableManager();
   }
 
-  public synchronized UniqueNameAllocator getUniqueNameAllocator() {
-    if (nameAllocator == null) {
-      nameAllocator = new UniqueNameAllocator(this);
-    }
-    return nameAllocator;
+  public UniqueNameAllocator getUniqueNameAllocator() {
+    return resourceManager.getUniqueNameAllocator();
   }
 
   public CryptoService getCryptoService() {
